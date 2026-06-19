@@ -1,0 +1,121 @@
+name: runner
+
+# FREE public-repo Actions run the weather_polymarket DRY-RUN pipeline so the
+# private strategy stays private. The strategy CODE + DATA live in the PRIVATE
+# repo (tpelletier2594-netizen/weather_polymarket); this workflow checks it out
+# at RUNTIME via a write-scoped deploy key, runs the pipeline, and pushes state
+# (weather.db + dashboards) BACK to the private repo. Strategy stdout is
+# redirected to a logfile pushed to the private repo, so THESE public logs stay
+# generic. DRY-RUN ONLY — no wallet key here (intraday armed() is false without
+# PK), so there is zero fund risk on this public repo.
+
+on:
+  schedule:
+    # Worldwide intraday 15-16h-LOCAL coverage (in UTC). Same dense set the
+    # private sentinel used to schedule — runs free here.
+    - cron: '7,27,47 2-5 * * *'      # 00z model cluster
+    - cron: '7,27,47 6-8 * * *'      # INTL: E/SE Asia, Korea, Japan (UTC+8/+9)
+    - cron: '7 9 * * *'              # lull nudge
+    - cron: '7,27,47 10-13 * * *'    # INTL: Karachi/Gulf/Moscow/Europe (UTC+5..+2)
+    - cron: '7,27,47 14-17 * * *'    # 12z cluster + London/Europe
+    - cron: '7,27,47 18 * * *'       # INTL: Buenos Aires, Sao Paulo (UTC-3)
+    - cron: '7,27,47 20-22 * * *'    # 18z cluster
+    - cron: '2,17,32,47 19-23 * * *' # US intraday window
+    - cron: '2,17,32,47 0,1 * * *'   # US intraday window
+  workflow_dispatch:
+
+permissions:
+  contents: write          # only for the heartbeat commit to THIS public repo
+
+concurrency:
+  group: runner
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: tpelletier2594-netizen/weather_polymarket
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout this (public) repo            # for the heartbeat only
+        uses: actions/checkout@v5
+
+      - name: Configure deploy key (SSH to private repo)
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.PRIVATE_REPO_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Clone private strategy repo (runtime only; discarded after the job)
+        run: |
+          git clone --depth 1 "git@github.com:${PRIVATE_REPO}.git" strat
+          cd strat
+          git config user.name  "weather-poly-runner[bot]"
+          git config user.email "runner@users.noreply.github.com"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: strat/requirements.txt
+
+      - name: Install deps
+        run: pip install -r strat/requirements.txt
+
+      - name: Run pipeline (DRY-RUN; full log redirected, kept OUT of public output)
+        working-directory: strat
+        env:
+          PYTHONUNBUFFERED: '1'
+          EVENT: ${{ github.event_name }}
+        run: |
+          set +e
+          {
+            echo "=== runner $(date -u +%FT%TZ) event=$EVENT ==="
+            python check_freshness.py; fresh=$?
+            echo "freshness exit=$fresh"
+            if [ "$fresh" = "0" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+              python daily_bets.py --mode all
+              for m in fav kelly robust boundary; do
+                f=$(ls -t outputs/daily_bets_${m}_*.xlsx 2>/dev/null | head -1)
+                [ -n "$f" ] && python bet_executor.py "$f"
+              done
+              python dashboard.py
+              python dashboard_v2.py
+            fi
+            python price_monitor.py
+            python obs_capture.py
+            python intraday_bets.py
+            python reward_monitor.py
+            echo "=== done $(date -u +%FT%TZ) ==="
+          } >> outputs/runner.log 2>&1
+          echo "pipeline finished (full log in private repo outputs/runner.log)"
+
+      - name: Push state back to the private repo
+        working-directory: strat
+        run: |
+          git add -A outputs/ data/weather.db || true
+          if git diff --cached --quiet; then echo "no state changes"; exit 0; fi
+          git commit -m "runner $(date -u +%FT%TZ) [skip ci]"
+          for a in 1 2 3 4 5; do
+            git push && { echo "pushed (try $a)"; exit 0; }
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort || true; git reset --soft origin/main; git commit -m "runner $(date -u +%FT%TZ) [skip ci]" || true; }
+            sleep 3
+          done
+          echo "::warning::could not push state after 5 tries; next run carries it"
+
+      - name: Heartbeat (keep this public repo's schedule alive; ~1/day)
+        if: github.event_name == 'schedule'
+        run: |
+          if [ "$(date -u +%H)" = "09" ]; then
+            date -u +%FT%TZ > heartbeat.txt
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add heartbeat.txt
+            git commit -m "heartbeat $(date -u +%FT%TZ)" || exit 0
+            git push || true
+          fi
