@@ -90,6 +90,7 @@ jobs:
             python obs_capture.py
             python intraday_bets.py
             python reward_monitor.py
+            python lp_paper.py          # LP reward dry-run (after reward_monitor)
             echo "=== done $(date -u +%FT%TZ) ==="
           } >> outputs/runner.log 2>&1
           echo "pipeline finished (full log in private repo outputs/runner.log)"
